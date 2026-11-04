@@ -7,6 +7,11 @@ Update: the user subsequently requested native photo/video preview. Eligible fil
 now use sendPhoto/sendVideo, with document fallback; see media-preview.md for the
 current media policy and limits. Split parts remain documents.
 
+Update: password-protected archives now use an interactive retry/cancel dialog.
+Encrypted 7z AES uses py7zr with validated writers; see password-dialog.md for the
+current behavior. The caption-only/encrypted-7z limitations below describe the
+initial design and are superseded by that update.
+
 Approaches: public Bot API cannot download these archives (20 MB download limit).
 A local Bot API service supports the requested size. Multipart input/link import
 was considered for 5 GB and is unnecessary after the user's 2 GB decision.

@@ -13,6 +13,8 @@ Repository ini belum merupakan rilis produksi yang terverifikasi.
 - Arsip masuk maksimal **2.000 MB** (2.000.000.000 byte, bukan 2 GiB).
 - Ekstraksi ZIP, 7z, TAR, TAR.GZ, RAR, dan format yang didukung libarchive.
   ZIP, 7z, dan TAR.GZ sudah diuji dengan arsip nyata secara lokal; RAR belum diuji.
+- Dialog password: minta password, coba lagi jika keliru, atau `/cancel` tanpa
+  mengunggah ulang arsip. 7z AES memakai py7zr; ZIP klasik/AES sudah diuji.
 - Foto/video yang didukung dikirim sebagai media dengan preview; file lain sebagai
   dokumen. Jalur folder tetap dicantumkan pada caption.
 - File hasil di atas 2.000 MB dibagi menjadi bagian maksimal 1.900 MB.
@@ -56,6 +58,7 @@ arsip 2 GB. Lihat [dokumentasi Telegram](https://core.telegram.org/bots/api#usin
 | Jumlah entri, termasuk folder | 3.000 per arsip |
 | Pekerjaan bersamaan | 1, tanpa antrean |
 | Waktu ekstraksi | Maksimal 1 jam |
+| Waktu tunggu password | 10 menit setiap permintaan |
 | Cadangan disk saat menulis hasil/bagian | 10.000.000.000 byte |
 | Ukuran bagian file besar | 1.900.000.000 byte |
 | Pembersihan cache dokumen tertinggal | Saat idle, umur lebih dari 4 jam |
@@ -89,9 +92,10 @@ docker build -t ekstrak-pribadi:local .
 docker run --rm --network none ekstrak-pribadi:local python -m unittest discover -s tests -v
 ```
 
-**Pemeriksaan terakhir: 38 tes lulus.** Cakupan meliputi ekstraksi ZIP/TAR.GZ/7z,
+**Pemeriksaan terakhir: 57 tes lulus.** Cakupan meliputi ekstraksi ZIP/TAR.GZ/7z,
 penolakan traversal/link, batas byte aktual, pemecahan file, akses pemilik,
-pembatalan, pembersihan, pemilihan media/fallback, HTTP simulasi, dan wizard. Lihat bukti serta batas
+pembatalan, pembersihan, dialog password, dekripsi nyata, pemilihan media/fallback,
+HTTP simulasi, dan wizard. Lihat bukti serta batas
 verifikasi di [docs/verification.md](docs/verification.md).
 
 Pemeriksaan sintaks pemasang:
@@ -183,16 +187,37 @@ tidak dikonversi atau diberi thumbnail buatan bot. Preview/thumbnail dan kemampu
 pemutaran akhirnya bergantung Telegram, format, dan aplikasi penerima. Video yang
 terpecah karena terlalu besar tetap perlu digabungkan dahulu.
 
-Untuk arsip berpassword, gunakan caption berikut saat mengirim dokumen:
+### Password arsip dan percobaan ulang
+
+Kirim arsip seperti biasa. Jika memerlukan password, bot akan meminta Anda
+mengirim password sebagai pesan teks di chat pribadi yang sama. Password tidak
+ditampilkan ulang oleh bot. Setelah password salah, bot meminta percobaan lain;
+arsip yang sudah diunduh tetap dipakai, sehingga tidak perlu dikirim ulang.
+
+- Kirim `/cancel` kapan saja untuk membatalkan dan membersihkan file sementara.
+- `/status` tetap bisa digunakan ketika bot menunggu password.
+- Tidak ada jawaban selama 10 menit: pekerjaan dibatalkan dan file dibersihkan.
+- Arsip lain ditolak selama pekerjaan masih aktif. Hasil parsial dari percobaan
+  gagal dibersihkan dan tidak dikirim ke Telegram.
+- Setelah restart, pekerjaan/password tidak dipulihkan; kirim ulang arsip.
+- Password melalui chat dipakai persis seperti teks yang dikirim, termasuk spasi.
+  `/start`, `/help`, `/status`, dan `/cancel` tetap merupakan perintah bot.
+
+Caption password lama masih didukung, jika Anda ingin memberikannya sejak awal:
 
 ```text
 password: KATA_SANDI_ARSIP
 ```
 
-Opsi diteruskan ke libarchive; tidak semua enkripsi didukung. Encrypted 7z dan
-beberapa varian RAR tidak dapat dibuka. Alur password belum diuji dengan arsip
-terenkripsi nyata. Caption password tetap menjadi bagian pesan Telegram dan tidak
-dihapus otomatis oleh bot.
+7z AES, termasuk nama file yang dienkripsi, memakai py7zr. ZIP klasik/ZipCrypto
+dan ZIP AES memakai libarchive dan telah diuji dengan fixture nyata. Metode
+kompresi/enkripsi lain, terutama varian RAR, tetap bergantung dukungan pustaka.
+Arsip terenkripsi yang rusak dapat menghasilkan error seperti password salah;
+gunakan `/cancel` jika beberapa password yang benar tetap ditolak.
+
+Password hanya dipakai sementara di memori, tidak disimpan ke `.env`, log, atau
+berkas state pekerjaan. Pesan password dan
+caption tetap berada dalam riwayat chat Telegram dan tidak dihapus otomatis.
 
 Jalur folder dicantumkan pada caption; Telegram tidak membangun kembali struktur
 folder secara otomatis. Folder kosong tidak dikirim. Arsip di dalam arsip dikirim
@@ -237,8 +262,8 @@ ulang dapat menghasilkan dokumen duplikat untuk hasil yang sebelumnya sudah masu
 - Hanya ID pemilik di chat pribadi yang bisa memakai bot. Pengguna lain/grup diabaikan.
 - Ekstraksi menerima file biasa/folder; menolak link, perangkat, jalur absolut,
   traversal `..`, dan nama file bertabrakan. Byte hasil dibatasi saat ditulis.
-- Proses ekstraksi memiliki batas memori/waktu dan tidak menerima token melalui
-  argumen atau environment.
+- Proses ekstraksi memiliki batas memori/waktu. Password arsip diteruskan melalui
+  stdin, bukan argumen proses, environment, log, atau berkas state pekerjaan.
 - Bot/API berjalan sebagai UID `101`, filesystem utama read-only, tanpa Docker
   socket/capabilities. Layanan `init` sesaat memakai root untuk kepemilikan volume.
 - Bot/API berbagi UID dan volume. Ekstraksi bukan sandbox container tersendiri;
@@ -257,7 +282,8 @@ ulang dapat menghasilkan dokumen duplikat untuk hasil yang sebelumnya sudah masu
 4. Pembatalan menunggu permintaan Telegram yang sudah berjalan. Timeout unduh/unggah
    masing-masing 30/60 menit; retry dapat menambah waktu tunggu.
 5. Status belum menampilkan persentase, kecepatan transfer, atau estimasi selesai.
-6. RAR dan skema enkripsi belum diuji; dukungan bergantung libarchive.
+6. RAR dan skema enkripsi selain fixture ZIP/7z yang diuji belum terverifikasi;
+   tidak semua metode didukung. Arsip pengguna yang memicu laporan belum diuji langsung.
 7. Batas operasi belum bisa dikonfigurasi. Pemulihan setup setelah `logOut`, rotasi
    token, dan penggantian pemilik belum diotomatisasi.
 8. Cadangan disk dan pembersihan cache belum diverifikasi pada server nyata.
@@ -274,7 +300,7 @@ extractor.py              Ekstraksi bertahap dan pemecahan hasil
 setup.py                  Wizard kredensial dan pendaftaran pemilik
 bootstrap.sh              Pemasang AlmaLinux 10
 compose.yaml              Layanan, volume, dan batas sumber daya
-Dockerfile                Image Python + libarchive
+Dockerfile                Image Python + libarchive + py7zr
 requirements.txt          Dependensi Python
 .env.example              Nama konfigurasi tanpa kredensial
 tests/                    Pengujian otomatis
@@ -282,12 +308,14 @@ docs/verification.md      Bukti dan batas pengujian
 docs/design.md            Rancangan awal
 docs/plan.md              Catatan implementasi awal
 docs/media-preview.md     Rancangan dan pengujian pengiriman media
+docs/password-dialog.md   Rancangan dialog dan dekripsi arsip berpassword
 ```
 
 Image Local Bot API memakai kemasan pihak ketiga aiogram, dikunci ke digest;
 versi yang diperiksa adalah Bot API 10.3. Image Python mengikuti tag
 `python:3.13-slim-trixie`, sehingga hasil build dapat berubah mengikuti pembaruan
-tag/paket sistem. Dependensi Python dikunci ke `libarchive-c==5.3`.
+tag/paket sistem. Dependensi langsung dikunci ke `libarchive-c==5.3` dan
+`py7zr==1.1.4`; dependensi transitif py7zr mengikuti batas versi paket tersebut.
 
 ## Mengunggah ke Git
 
@@ -311,3 +339,4 @@ Alamat remote, visibilitas repository, dan lisensi ditentukan pemilik proyek.
 - [Docker Engine untuk RHEL](https://docs.docker.com/engine/install/rhel/)
 - [Image aiogram/telegram-bot-api](https://github.com/aiogram/telegram-bot-api)
 - [libarchive-c](https://github.com/Changaco/python-libarchive-c)
+- [py7zr](https://py7zr.readthedocs.io/en/latest/api.html)

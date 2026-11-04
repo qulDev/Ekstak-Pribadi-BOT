@@ -13,6 +13,10 @@ class ArchiveRejected(Exception):
     pass
 
 
+class PasswordNeeded(ArchiveRejected):
+    """Retryable encrypted archive error; never includes the supplied password."""
+
+
 @dataclass(frozen=True)
 class Limits:
     max_total: int = 20_000_000_000
@@ -39,6 +43,12 @@ def extract_archive(source: Path, output: Path, password=None, limits=Limits()) 
     from libarchive.exception import ArchiveError
 
     output.mkdir(parents=True, exist_ok=True)
+    with source.open('rb') as stream:
+        is_sevenzip = stream.read(6) == b'7z\xbc\xaf\x27\x1c'
+    if is_sevenzip:
+        result = extract_encrypted_7z(source, output, password, limits)
+        if result is not None:
+            return result
     files, total, seen = [], 0, set()
     try:
         with libarchive.file_reader(str(source), passphrase=password) as archive:
@@ -73,8 +83,132 @@ def extract_archive(source: Path, output: Path, password=None, limits=Limits()) 
                         total += len(block)
                 files.append(path)
     except ArchiveError as exc:
+        detail = str(exc).lower()
+        if ('passphrase' in detail or 'password' in detail) and not any(
+                word in detail for word in ['unsupported', 'not supported', 'not support']):
+            raise PasswordNeeded('Arsip memerlukan password atau password belum cocok.') from None
         raise ArchiveRejected('Arsip rusak, password keliru, atau format/enkripsinya belum didukung.') from exc
     return files
+
+
+def extract_encrypted_7z(source, output, password, limits):
+    import lzma
+    import zlib
+    import py7zr
+    from py7zr import compressor
+    from py7zr import exceptions as seven_errors
+    from py7zr.io import Py7zIO, WriterFactory
+
+    class Writer(Py7zIO):
+        def __init__(self, path, factory):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.file = path.open('x+b')
+            self.factory, self.high_water = factory, 0
+
+        def write(self, data):
+            growth = max(0, self.file.tell() + len(data) - self.high_water)
+            if self.factory.total + growth > limits.max_total:
+                raise ArchiveRejected('Total hasil ekstraksi melewati batas 20 GB.')
+            if shutil.disk_usage(output).free < limits.min_free + growth:
+                raise ArchiveRejected('Ruang penyimpanan bebas tidak mencukupi.')
+            written = self.file.write(data)
+            self.factory.total += growth
+            self.high_water = max(self.high_water, self.file.tell())
+            return written
+
+        def read(self, size=None):
+            return self.file.read(-1 if size is None else size)
+
+        def seek(self, offset, whence=0):
+            target = offset if whence == 0 else (self.file.tell() if whence == 1 else self.high_water) + offset
+            if not 0 <= target <= self.high_water:
+                raise ArchiveRejected('Posisi tulis arsip tidak valid.')
+            return self.file.seek(offset, whence)
+
+        def flush(self):
+            if not self.file.closed:
+                self.file.flush()
+
+        def size(self):
+            return self.high_water
+
+        def close(self):
+            self.file.close()
+
+    class Factory(WriterFactory):
+        def __init__(self, allowed):
+            self.allowed, self.total, self.writers = allowed, 0, []
+
+        def create(self, filename):
+            path = safe_path(output, filename)
+            if path not in self.allowed:
+                raise ArchiveRejected('Arsip mencoba membuat file yang tidak terdaftar.')
+            writer = Writer(path, self)
+            self.writers.append(writer)
+            return writer
+
+        def close(self):
+            for writer in self.writers:
+                writer.close()
+
+    factory, encrypted = None, False
+    try:
+        # needs_password() is also set merely by supplying a password to py7zr.
+        # Probe without one so a caption cannot turn a plain/corrupt archive into
+        # a password retry loop.
+        try:
+            with py7zr.SevenZipFile(source, max_extract_size=limits.max_total) as probe:
+                encrypted = probe.needs_password()
+        except seven_errors.PasswordRequired:
+            encrypted = True
+        if not encrypted:
+            return None
+        if password is None:
+            raise PasswordNeeded('Arsip ini dilindungi password.')
+        with py7zr.SevenZipFile(source, password=password, max_extract_size=limits.max_total) as archive:
+            entries = archive.list()
+            if len(entries) > limits.max_entries:
+                raise ArchiveRejected('Terlalu banyak entri dalam arsip.')
+            files, seen, declared = [], set(), 0
+            for entry in entries:
+                if entry.is_symlink or not (entry.is_directory or entry.is_file):
+                    raise ArchiveRejected('Link dan file khusus tidak diperbolehkan.')
+                path = safe_path(output, entry.filename)
+                if entry.is_directory:
+                    continue
+                if path == output or path in seen or path.exists():
+                    raise ArchiveRejected('Arsip memiliki nama file yang bertabrakan.')
+                seen.add(path)
+                files.append(path)
+                declared += entry.uncompressed
+                if len(files) > limits.max_files or entry.uncompressed < 0 or declared > limits.max_total:
+                    raise ArchiveRejected('Ukuran atau jumlah file hasil melewati batas.')
+            factory = Factory(seen)
+            archive.extractall(factory=factory)
+            return files
+    except seven_errors.PasswordRequired:
+        raise PasswordNeeded('Arsip ini dilindungi password.') from None
+    except seven_errors.UnsupportedCompressionMethodError:
+        raise ArchiveRejected('Metode kompresi atau enkripsi 7z ini belum didukung.') from None
+    except seven_errors.DecompressionBombError:
+        raise ArchiveRejected('Total hasil ekstraksi melewati batas 20 GB.') from None
+    except OSError as exc:
+        # BZIP2 reports invalid decrypted bytes as a bare OSError. Real disk and
+        # permission errors must stay fatal rather than ask for another password.
+        if exc.errno is None and str(exc) == 'Invalid data stream':
+            if encrypted and password is not None:
+                raise PasswordNeeded('Password belum cocok atau arsip terenkripsi rusak.') from None
+            raise ArchiveRejected('Arsip 7z rusak atau formatnya belum didukung.') from None
+        raise
+    except (seven_errors.Bad7zFile, seven_errors.CrcError, seven_errors.DecompressionError,
+            lzma.LZMAError, zlib.error, compressor.zstd.ZstdError, compressor.brotli.error,
+            EOFError, TypeError, ValueError):
+        if encrypted and password is not None:
+            raise PasswordNeeded('Password belum cocok atau arsip terenkripsi rusak.') from None
+        raise ArchiveRejected('Arsip 7z rusak atau formatnya belum didukung.') from None
+    finally:
+        if factory:
+            factory.close()
 
 
 def iter_send_files(path: Path, scratch: Path, limit=2_000_000_000, part_size=1_900_000_000,
@@ -117,6 +251,9 @@ def main():
     try:
         extract_archive(args.source, args.output, password=password,
                         limits=Limits(min_free=int(payload.get('min_free', Limits().min_free))))
+    except PasswordNeeded as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     except (ArchiveRejected, OSError, ValueError) as exc:
         message = str(exc) if isinstance(exc, ArchiveRejected) else 'Gagal menulis hasil ekstraksi.'
         print(message, file=sys.stderr)

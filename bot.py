@@ -20,11 +20,12 @@ MAX_INPUT = 2_000_000_000
 MAX_PHOTO = 10_000_000
 MIN_FREE = 10_000_000_000
 EXTRACT_TIMEOUT = 3600
+PASSWORD_TIMEOUT = 600
 HELP = ('Kirim ZIP, 7z, RAR, TAR atau arsip terkompresi (maks. 2.000 MB).\n'
         'Foto dan video yang didukung dikirim sebagai media dengan preview.\n'
         'Batas hasil: 20 GB dan 300 file. Arsip di dalam arsip tidak diekstrak ulang.\n'
-        'Untuk arsip berpassword, gunakan caption: password: KATA_SANDI\n'
-        'Beberapa enkripsi 7z/RAR belum didukung.\n'
+        'Jika arsip terkunci, bot meminta password di chat. Salah? Coba lagi atau /cancel.\n'
+        'Caption password: KATA_SANDI tetap bisa digunakan. Enkripsi RAR tertentu belum didukung.\n'
         '/status — lihat proses\n/cancel — hentikan proses\n'
         'Hasil di atas 2.000 MB dibagi menjadi file .part001 dan seterusnya.')
 
@@ -81,6 +82,10 @@ class Job:
     started: float = field(default_factory=time.monotonic)
     phase: str = 'Menunggu unduhan'
     thread: threading.Thread | None = None
+    waiting_password: bool = False
+    password_value: str | None = field(default=None, repr=False)
+    password_ready: threading.Event = field(default_factory=threading.Event, repr=False)
+    password_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 class Bot:
@@ -172,6 +177,16 @@ class Bot:
             else:
                 self.say('Tidak ada proses yang perlu dibatalkan.')
             return
+        job = self.job
+        if job and 'text' in message:
+            with job.password_lock:
+                if job.waiting_password:
+                    # Preserve spaces and Unicode; never echo or persist the password.
+                    job.password_value = message['text']
+                    job.waiting_password = False
+                    job.phase = 'Memeriksa password'
+                    job.password_ready.set()
+                    return
         document = message.get('document')
         if not document:
             self.say(HELP)
@@ -190,10 +205,81 @@ class Bot:
         job.thread = threading.Thread(target=self.work, args=(job, message), daemon=True)
         job.thread.start()
 
+    def ask_password(self, job, retry=False):
+        with job.password_lock:
+            job.password_value = None
+            job.password_ready.clear()
+            job.waiting_password = True
+            job.phase = 'Menunggu password'
+        try:
+            prompt = ('Password belum cocok atau arsip terenkripsi bermasalah. Coba kirim password lagi'
+                      if retry else 'Arsip ini dilindungi password. Kirim password sebagai pesan teks')
+            self.say(prompt + ', atau /cancel untuk membatalkan. Batas tunggu 10 menit.')
+            deadline = time.monotonic() + PASSWORD_TIMEOUT
+            while True:
+                if job.cancel.is_set() or self.stopping.is_set():
+                    raise APIError('Proses dibatalkan.')
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise APIError('Batas waktu menunggu password habis. File sementara dibersihkan.')
+                if job.password_ready.wait(min(0.2, remaining)):
+                    if job.cancel.is_set() or self.stopping.is_set():
+                        raise APIError('Proses dibatalkan.')
+                    with job.password_lock:
+                        return job.password_value
+        finally:
+            with job.password_lock:
+                job.waiting_password = False
+                job.password_value = None
+
+    def extract_once(self, job, source, output, directory, password):
+        env = {'PATH': os.environ.get('PATH', ''), 'PYTHONUNBUFFERED': '1', 'PYTHONDONTWRITEBYTECODE': '1'}
+        with (directory / 'error.txt').open('wb') as error_log:
+            child = subprocess.Popen([sys.executable, str(Path(__file__).with_name('extractor.py')),
+                                      str(source), str(output)], stdin=subprocess.PIPE,
+                                     stdout=subprocess.DEVNULL, stderr=error_log, env=env)
+            try:
+                child.stdin.write(json.dumps({'password': password, 'min_free': MIN_FREE}).encode() + b'\n')
+                child.stdin.close()
+                deadline = time.monotonic() + EXTRACT_TIMEOUT
+                while child.poll() is None:
+                    if job.cancel.is_set() or self.stopping.is_set() or time.monotonic() > deadline:
+                        raise APIError('Proses dibatalkan atau melewati batas waktu satu jam.')
+                    job.cancel.wait(0.25)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
+        detail = (directory / 'error.txt').read_text(errors='replace').strip()
+        if 'Traceback' in detail or len(detail) > 350:
+            detail = 'Arsip rusak atau format/enkripsinya belum didukung.'
+        return child.returncode, detail
+
+    def extract_with_password(self, job, source, output, directory, password):
+        retry = password is not None
+        while True:
+            if job.cancel.is_set() or self.stopping.is_set():
+                raise APIError('Proses dibatalkan.')
+            if output.exists():
+                shutil.rmtree(output)
+            job.phase = 'Mengekstrak'
+            self.say('Mengekstrak arsip…')
+            result, detail = self.extract_once(job, source, output, directory, password)
+            password = None
+            if result == 0:
+                return
+            if result != 2:
+                raise APIError(detail or 'Ekstraksi gagal.')
+            # No partial result is sent or retained while waiting for another password.
+            if output.exists():
+                shutil.rmtree(output)
+            password = self.ask_password(job, retry=retry)
+            retry = True
+
     def work(self, job, message):
         directory = self.jobsdir / uuid.uuid4().hex
         output, parts = directory / 'output', directory / 'parts'
-        source, child, sent = None, None, 0
+        source, sent = None, 0
         try:
             directory.mkdir()
             if shutil.disk_usage(self.workdir).free < MIN_FREE + MAX_INPUT:
@@ -208,31 +294,10 @@ class Bot:
                 raise APIError('Arsip tidak tersedia atau ukurannya melampaui batas.')
             if job.cancel.is_set():
                 raise APIError('Proses dibatalkan.')
-            job.phase = 'Mengekstrak'
-            self.say('Mengekstrak arsip…')
             caption = message.get('caption', '')
             password = caption[9:].strip() if caption.lower().startswith('password:') else None
-            # No token/API hash passed to the extraction subprocess.
-            env = {'PATH': os.environ.get('PATH', ''), 'PYTHONUNBUFFERED': '1', 'PYTHONDONTWRITEBYTECODE': '1'}
-            with (directory / 'error.txt').open('wb') as error_log:
-                child = subprocess.Popen([sys.executable, str(Path(__file__).with_name('extractor.py')),
-                                          str(source), str(output)], stdin=subprocess.PIPE,
-                                         stdout=subprocess.DEVNULL, stderr=error_log, env=env)
-                child.stdin.write(json.dumps({'password': password, 'min_free': MIN_FREE}).encode() + b'\n')
-                child.stdin.close()
-                deadline = time.monotonic() + EXTRACT_TIMEOUT
-                while child.poll() is None:
-                    if job.cancel.is_set() or self.stopping.is_set() or time.monotonic() > deadline:
-                        child.kill()
-                        child.wait()
-                        raise APIError('Proses dibatalkan atau melewati batas waktu satu jam.')
-                    job.cancel.wait(0.25)
-            if child.returncode:
-                detail = (directory / 'error.txt').read_text(errors='replace').strip()
-                # Worker prints controlled errors; never echo unexpected traceback or secret paths.
-                if 'Traceback' in detail or len(detail) > 350:
-                    detail = 'Arsip rusak atau format/enkripsinya belum didukung.'
-                raise APIError(detail or 'Ekstraksi gagal.')
+            self.extract_with_password(job, source, output, directory, password)
+            password = None
             files = sorted(p for p in output.rglob('*') if p.is_file())
             if not files:
                 raise APIError('Arsip tidak berisi file biasa yang dapat dikirim.')
@@ -255,9 +320,6 @@ class Bot:
             self.notify(f'Proses gagal. Sudah terkirim: {sent} file. Kirim ulang arsip untuk mencoba lagi.')
             print('Pekerjaan gagal; rincian yang dapat memuat rahasia tidak dicatat.', flush=True)
         finally:
-            if child and child.poll() is None:
-                child.kill()
-                child.wait()
             shutil.rmtree(directory, ignore_errors=True)
             if source and allowed_cache_file(source, self.cache, self.bot_key):
                 try:

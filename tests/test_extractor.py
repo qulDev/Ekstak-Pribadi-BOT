@@ -120,6 +120,7 @@ class ExtractionTests(unittest.TestCase):
                                    pathname='lying.txt', size=1,
                                    get_blocks=lambda **kw: iter([b'abc', b'def']))]
 
+        (self.root / 'unused').write_bytes(b'fixture')
         with patch('libarchive.file_reader', reader), self.assertRaises(ArchiveRejected):
             extract_archive(self.root / 'unused', self.out, limits=self.limits(max_total=4))
         self.assertEqual((self.out / 'lying.txt').read_bytes(), b'abc')
