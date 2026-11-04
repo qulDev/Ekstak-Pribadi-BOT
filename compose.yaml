@@ -1,0 +1,69 @@
+name: ekstrak-pribadi
+
+services:
+  init:
+    image: ekstrak-pribadi:local
+    user: "0:0"
+    command: ["python", "-c", "import os; os.chown('/work',101,101); os.chown('/var/lib/telegram-bot-api',101,101)"]
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - work:/work
+      - api-cache:/var/lib/telegram-bot-api
+
+  api:
+    image: aiogram/telegram-bot-api@sha256:280e1e9a6010e077caa56a319b55a0ea9c86423007ebe5e99e81e311c04e3e01
+    user: "101:101"
+    entrypoint: [telegram-bot-api]
+    command: ["--local", "--dir=/var/lib/telegram-bot-api", "--temp-dir=/var/lib/telegram-bot-api/.tmp", "--http-port=8081", "--verbosity=0"]
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:?Jalankan setup terlebih dahulu}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?Jalankan setup terlebih dahulu}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - api-cache:/var/lib/telegram-bot-api
+      - work:/work:ro
+    read_only: true
+    tmpfs: ["/tmp:size=64m,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 4g
+    cpus: 2
+    restart: unless-stopped
+    logging:
+      options: {max-size: "10m", max-file: "3"}
+
+  bot:
+    image: ekstrak-pribadi:local
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?Jalankan setup terlebih dahulu}
+      OWNER_ID: ${OWNER_ID:?Jalankan setup terlebih dahulu}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      api:
+        condition: service_started
+    volumes:
+      - work:/work
+      - api-cache:/var/lib/telegram-bot-api
+    read_only: true
+    tmpfs: ["/tmp:size=64m,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 6g
+    cpus: 3
+    stop_grace_period: 30s
+    restart: unless-stopped
+    logging:
+      options: {max-size: "10m", max-file: "3"}
+
+volumes:
+  work:
+  api-cache:

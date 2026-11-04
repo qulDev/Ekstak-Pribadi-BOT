@@ -1,0 +1,9 @@
+.env
+.env.*
+.setup-complete
+.venv
+__pycache__
+.git
+*.log
+*.zip
+*.tar.gz
