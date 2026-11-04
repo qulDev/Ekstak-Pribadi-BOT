@@ -3,6 +3,10 @@
 Scope approved in chat: private Telegram bot on AlmaLinux 10.2; single archives
 up to 2,000,000,000 bytes, extracted contents returned as documents.
 
+Update: the user subsequently requested native photo/video preview. Eligible files
+now use sendPhoto/sendVideo, with document fallback; see media-preview.md for the
+current media policy and limits. Split parts remain documents.
+
 Approaches: public Bot API cannot download these archives (20 MB download limit).
 A local Bot API service supports the requested size. Multipart input/link import
 was considered for 5 GB and is unnecessary after the user's 2 GB decision.

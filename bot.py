@@ -17,9 +17,11 @@ from pathlib import Path
 from extractor import ArchiveRejected, iter_send_files
 
 MAX_INPUT = 2_000_000_000
+MAX_PHOTO = 10_000_000
 MIN_FREE = 10_000_000_000
 EXTRACT_TIMEOUT = 3600
 HELP = ('Kirim ZIP, 7z, RAR, TAR atau arsip terkompresi (maks. 2.000 MB).\n'
+        'Foto dan video yang didukung dikirim sebagai media dengan preview.\n'
         'Batas hasil: 20 GB dan 300 file. Arsip di dalam arsip tidak diekstrak ulang.\n'
         'Untuk arsip berpassword, gunakan caption: password: KATA_SANDI\n'
         'Beberapa enkripsi 7z/RAR belum didukung.\n'
@@ -119,6 +121,24 @@ class Bot:
             self.say(text)
         except APIError:
             print('Notifikasi tidak terkirim; periksa koneksi Telegram.', flush=True)
+
+    def send_file(self, path: Path, caption: str):
+        method, parameter = 'sendDocument', 'document'
+        suffix, size = path.suffix.lower(), path.stat().st_size
+        if suffix in {'.jpg', '.jpeg', '.png', '.webp'} and 0 < size <= MAX_PHOTO:
+            method, parameter = 'sendPhoto', 'photo'
+        elif suffix in {'.mp4', '.m4v', '.mov'} and size > 0:
+            method, parameter = 'sendVideo', 'video'
+        uri = path.as_uri()
+        common = {'chat_id': self.owner, 'caption': caption, 'request_timeout': 3600}
+        try:
+            self.api.call(method, **{parameter: uri}, **common)
+        except APIError as exc:
+            # Only explicit rejection is safe to retry as a document. A timed-out
+            # upload may already have been accepted and must not be sent twice.
+            if method == 'sendDocument' or exc.code not in (400, 413):
+                raise
+            self.api.call('sendDocument', document=uri, **common)
 
     def clean_cache(self, max_age=4 * 3600):
         for root in [self.cache / str(self.bot_key), self.cache / str(self.bot_key).replace(':', '~')]:
@@ -224,17 +244,15 @@ class Bot:
                     if job.cancel.is_set() or self.stopping.is_set():
                         raise APIError('Proses dibatalkan.')
                     job.phase = f'Mengirim file {index}/{len(files)}{suffix}'
-                    self.api.call('sendDocument', chat_id=self.owner, document=send_path.as_uri(),
-                                  caption=(path.relative_to(output).as_posix() + suffix)[:900],
-                                  request_timeout=3600)
+                    self.send_file(send_path, (path.relative_to(output).as_posix() + suffix)[:900])
                     sent += 1
                     job.cancel.wait(1)
-            self.notify(f'Selesai. {sent} dokumen terkirim. File sementara dibersihkan.')
+            self.notify(f'Selesai. {sent} file terkirim. File sementara dibersihkan.')
         except (APIError, ArchiveRejected) as exc:
-            self.notify(f'{exc}\nSudah terkirim: {sent} dokumen. Anda dapat mengirim ulang arsip.')
+            self.notify(f'{exc}\nSudah terkirim: {sent} file. Anda dapat mengirim ulang arsip.')
         except Exception:
             # Exception text can include paths containing bot tokens; keep logs generic.
-            self.notify(f'Proses gagal. Sudah terkirim: {sent} dokumen. Kirim ulang arsip untuk mencoba lagi.')
+            self.notify(f'Proses gagal. Sudah terkirim: {sent} file. Kirim ulang arsip untuk mencoba lagi.')
             print('Pekerjaan gagal; rincian yang dapat memuat rahasia tidak dicatat.', flush=True)
         finally:
             if child and child.poll() is None:

@@ -13,7 +13,8 @@ Repository ini belum merupakan rilis produksi yang terverifikasi.
 - Arsip masuk maksimal **2.000 MB** (2.000.000.000 byte, bukan 2 GiB).
 - Ekstraksi ZIP, 7z, TAR, TAR.GZ, RAR, dan format yang didukung libarchive.
   ZIP, 7z, dan TAR.GZ sudah diuji dengan arsip nyata secara lokal; RAR belum diuji.
-- Hasil dikirim sebagai dokumen, dengan jalur folder pada caption.
+- Foto/video yang didukung dikirim sebagai media dengan preview; file lain sebagai
+  dokumen. Jalur folder tetap dicantumkan pada caption.
 - File hasil di atas 2.000 MB dibagi menjadi bagian maksimal 1.900 MB.
 - Pendaftaran pemilik melalui pesan sekali pakai ke bot sendiri.
 - Perintah bantuan, status proses, dan pembatalan.
@@ -36,7 +37,7 @@ Local Bot API mengunduh arsip ke volume bersama
 Proses terpisah mengekstrak dan membatasi hasil
         |
         v
-Bot mengirim file hasil / bagian file besar
+Bot mengirim foto, video, dokumen / bagian file besar
         |
         v
 File sementara dibersihkan
@@ -88,9 +89,9 @@ docker build -t ekstrak-pribadi:local .
 docker run --rm --network none ekstrak-pribadi:local python -m unittest discover -s tests -v
 ```
 
-**Pemeriksaan terakhir: 28 tes lulus.** Cakupan meliputi ekstraksi ZIP/TAR.GZ/7z,
+**Pemeriksaan terakhir: 38 tes lulus.** Cakupan meliputi ekstraksi ZIP/TAR.GZ/7z,
 penolakan traversal/link, batas byte aktual, pemecahan file, akses pemilik,
-pembatalan, pembersihan, HTTP simulasi, dan wizard. Lihat bukti serta batas
+pembatalan, pembersihan, pemilihan media/fallback, HTTP simulasi, dan wizard. Lihat bukti serta batas
 verifikasi di [docs/verification.md](docs/verification.md).
 
 Pemeriksaan sintaks pemasang:
@@ -158,6 +159,29 @@ mengisi `.env` manual saja tidak mendaftarkan pemilik atau memindahkan Bot API.
 | Kirim arsip sebagai dokumen | Unduh, ekstrak, dan kirim hasil |
 | `/status` | Tahap proses dan waktu berjalan |
 | `/cancel` | Meminta pembatalan pekerjaan |
+
+### Foto dan video dengan preview
+
+Bot memilih cara kirim berdasarkan ekstensi, tanpa mengonversi file terlebih dahulu:
+
+| File hasil | Cara kirim |
+| --- | --- |
+| `.jpg`, `.jpeg`, `.png`, `.webp` sampai 10.000.000 byte | Foto (`sendPhoto`) |
+| `.mp4`, `.m4v`, `.mov` | Video (`sendVideo`) |
+| Foto di atas batas tersebut, format lain, atau bagian `.part001` | Dokumen (`sendDocument`) |
+
+Ekstensi tidak menjamin isinya valid. Telegram memeriksa isi, dimensi foto, dan
+dukungan format video. Jika percobaan media ditolak dengan respons API `400` atau
+`413`, bot mencoba sekali lagi sebagai dokumen, dengan caption yang sama.
+Error koneksi, akses, rate limit, atau server tidak memicu fallback ini. Khusus
+koneksi yang terputus, bot tidak tahu apakah media sudah diterima, sehingga tidak
+langsung mengulang pengiriman sebagai dokumen.
+
+Foto yang dikirim sebagai media dapat diproses ulang oleh Telegram; hasil yang
+diterima tidak dijamin identik byte demi byte dengan gambar dalam arsip. Video
+tidak dikonversi atau diberi thumbnail buatan bot. Preview/thumbnail dan kemampuan
+pemutaran akhirnya bergantung Telegram, format, dan aplikasi penerima. Video yang
+terpecah karena terlalu besar tetap perlu digabungkan dahulu.
 
 Untuk arsip berpassword, gunakan caption berikut saat mengirim dokumen:
 
@@ -238,6 +262,9 @@ ulang dapat menghasilkan dokumen duplikat untuk hasil yang sebelumnya sudah masu
    token, dan penggantian pemilik belum diotomatisasi.
 8. Cadangan disk dan pembersihan cache belum diverifikasi pada server nyata.
 9. Lisensi belum ditentukan; berkas `LICENSE` belum tersedia.
+10. Preview media belum diuji langsung di Telegram; tidak semua format video/foto
+    dapat ditampilkan. Belum ada konversi video, thumbnail khusus, atau pilihan
+    mengirim foto sebagai file asli tanpa pemrosesan Telegram.
 
 ## Struktur repository
 
@@ -254,6 +281,7 @@ tests/                    Pengujian otomatis
 docs/verification.md      Bukti dan batas pengujian
 docs/design.md            Rancangan awal
 docs/plan.md              Catatan implementasi awal
+docs/media-preview.md     Rancangan dan pengujian pengiriman media
 ```
 
 Image Local Bot API memakai kemasan pihak ketiga aiogram, dikunci ke digest;
