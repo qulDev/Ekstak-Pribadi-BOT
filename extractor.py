@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -20,8 +21,8 @@ class PasswordNeeded(ArchiveRejected):
 @dataclass(frozen=True)
 class Limits:
     max_total: int = 20_000_000_000
-    max_files: int = 300
-    max_entries: int = 3000
+    max_files: int = 10_000
+    max_entries: int = 30_000
     min_free: int = 10_000_000_000
 
 
@@ -211,6 +212,55 @@ def extract_encrypted_7z(source, output, password, limits):
     finally:
         if factory:
             factory.close()
+
+
+def iter_zip_packages(files, root: Path, scratch: Path, limit=1_900_000_000,
+                      min_free=Limits().min_free, cancelled=lambda: False):
+    """Yield one complete ZIP at a time, then files too large for a ZIP."""
+    batches, oversized = [], []
+    batch, budget = [], 128
+    for path in files:
+        name = path.relative_to(root).as_posix()
+        # Stored ZIP entries use a local and central header, each with the UTF-8 name.
+        # Leave extra room for metadata and the archive footer.
+        cost = path.stat().st_size + 2 * len(name.encode('utf-8')) + 256
+        if cost + 128 > limit:
+            oversized.append((path, name))
+            continue
+        if budget + cost > limit:
+            batches.append((batch, budget))
+            batch, budget = [], 128
+        batch.append((path, name))
+        budget += cost
+    if batch:
+        batches.append((batch, budget))
+
+    scratch.mkdir(parents=True, exist_ok=True)
+    for index, (members, budget) in enumerate(batches, 1):
+        if cancelled():
+            raise ArchiveRejected('Proses dibatalkan.')
+        if shutil.disk_usage(scratch).free < min_free + budget:
+            raise ArchiveRejected('Ruang bebas tidak cukup untuk membuat paket ZIP hasil.')
+        package = scratch / f'hasil-{index:03}.zip'
+        try:
+            with zipfile.ZipFile(package, 'x', zipfile.ZIP_STORED, allowZip64=False) as archive:
+                for path, name in members:
+                    if cancelled():
+                        raise ArchiveRejected('Proses dibatalkan.')
+                    entry = zipfile.ZipInfo.from_file(path, name, strict_timestamps=False)
+                    with path.open('rb') as source, archive.open(entry, 'w') as target:
+                        while block := source.read(1024 * 1024):
+                            if cancelled():
+                                raise ArchiveRejected('Proses dibatalkan.')
+                            if shutil.disk_usage(scratch).free < min_free + len(block):
+                                raise ArchiveRejected('Ruang bebas tidak cukup untuk membuat paket ZIP hasil.')
+                            target.write(block)
+            if package.stat().st_size > limit:
+                raise ArchiveRejected('Paket ZIP hasil melewati batas ukuran.')
+            yield package, f'Paket ZIP {index}/{len(batches)}'
+        finally:
+            package.unlink(missing_ok=True)
+    yield from oversized
 
 
 def iter_send_files(path: Path, scratch: Path, limit=2_000_000_000, part_size=1_900_000_000,

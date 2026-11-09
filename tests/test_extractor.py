@@ -4,8 +4,10 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from extractor import ArchiveRejected, Limits, extract_archive, iter_send_files, safe_path
+from extractor import ArchiveRejected, Limits, extract_archive, iter_send_files, iter_zip_packages, safe_path
 
 
 class ExtractionTests(unittest.TestCase):
@@ -84,6 +86,39 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(names[0], 'large.bin.part001')
         self.assertFalse(list((self.root / 'parts').glob('*')))
 
+    def test_zip_packages_open_independently_and_preserve_paths_under_limit(self):
+        expected = {'first/café.txt': b'a' * 240, 'second/café.txt': b'b' * 240}
+        files = extract_archive(self.zip(expected.items()), self.out, limits=self.limits())
+        large = self.out / 'large.bin'
+        large.write_bytes(b'x' * 1000)
+        scratch = self.root / 'packages'
+        packages = iter_zip_packages([*files, large], self.out, scratch, limit=800, min_free=0)
+        found = {}
+        for _ in range(2):
+            package, _ = next(packages)
+            self.assertEqual(list(scratch.iterdir()), [package])
+            self.assertLessEqual(package.stat().st_size, 800)
+            with zipfile.ZipFile(package) as archive:
+                self.assertIsNone(archive.testzip())
+                for name in archive.namelist():
+                    self.assertNotIn(name, found)
+                    found[name] = archive.read(name)
+        self.assertEqual(found, expected)
+        self.assertEqual(list(packages), [(large, 'large.bin')])
+        self.assertFalse(list(scratch.iterdir()))
+
+    def test_zip_packaging_releases_scratch_on_cancel_or_low_disk(self):
+        files = extract_archive(self.zip([('a.txt', b'ok')]), self.out, limits=self.limits())
+        scratch = self.root / 'packages'
+        checks = iter([False, False, True])
+        with self.assertRaisesRegex(ArchiveRejected, 'dibatalkan'):
+            list(iter_zip_packages(files, self.out, scratch, min_free=0, cancelled=lambda: next(checks)))
+        self.assertFalse(list(scratch.iterdir()))
+        with patch('extractor.shutil.disk_usage', return_value=SimpleNamespace(free=100)):
+            with self.assertRaisesRegex(ArchiveRejected, 'Ruang bebas tidak cukup'):
+                list(iter_zip_packages(files, self.out, scratch, min_free=100))
+        self.assertFalse(list(scratch.iterdir()))
+
     def test_small_file_is_sent_unchanged(self):
         p = self.root / 'small.txt'
         p.write_bytes(b'ok')
@@ -111,8 +146,6 @@ class ExtractionTests(unittest.TestCase):
 
     def test_actual_block_limit_even_when_header_is_small(self):
         from contextlib import contextmanager
-        from types import SimpleNamespace
-        from unittest.mock import patch
 
         @contextmanager
         def reader(*args, **kwargs):
@@ -135,8 +168,6 @@ class ExtractionTests(unittest.TestCase):
         self.assertFalse(part.exists())
 
     def test_splitting_preserves_free_disk_reserve(self):
-        from types import SimpleNamespace
-        from unittest.mock import patch
         p = self.root / 'large.bin'
         p.write_bytes(b'0123456789')
         with patch('extractor.shutil.disk_usage', return_value=SimpleNamespace(free=9)), self.assertRaises(ArchiveRejected):

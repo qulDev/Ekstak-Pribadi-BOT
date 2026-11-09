@@ -16,7 +16,9 @@ Repository ini belum merupakan rilis produksi yang terverifikasi.
 - Dialog password: minta password, coba lagi jika keliru, atau `/cancel` tanpa
   mengunggah ulang arsip. 7z AES memakai py7zr; ZIP klasik/AES sudah diuji.
 - Foto/video yang didukung dikirim sebagai media dengan preview; file lain sebagai
-  dokumen. Jalur folder tetap dicantumkan pada caption.
+  dokumen jika hasilnya paling banyak 30 file.
+- Lebih dari 30 file hasil dikemas menjadi ZIP terpisah secara otomatis. Tiap ZIP
+  dapat dibuka sendiri dan menyimpan jalur folder file di dalamnya.
 - File hasil di atas 2.000 MB dibagi menjadi bagian maksimal 1.900 MB.
 - Pendaftaran pemilik melalui pesan sekali pakai ke bot sendiri.
 - Perintah bantuan, status proses, dan pembatalan.
@@ -39,7 +41,7 @@ Local Bot API mengunduh arsip ke volume bersama
 Proses terpisah mengekstrak dan membatasi hasil
         |
         v
-Bot mengirim foto, video, dokumen / bagian file besar
+Bot mengirim file satu per satu atau mengemasnya menjadi ZIP
         |
         v
 File sementara dibersihkan
@@ -54,12 +56,14 @@ arsip 2 GB. Lihat [dokumentasi Telegram](https://core.telegram.org/bots/api#usin
 | --- | --- |
 | Ukuran arsip masuk | 2.000.000.000 byte |
 | Total hasil ekstraksi | 20.000.000.000 byte |
-| Jumlah file biasa | 300 per arsip |
-| Jumlah entri, termasuk folder | 3.000 per arsip |
+| Jumlah file biasa | 10.000 per arsip |
+| Jumlah entri, termasuk folder | 30.000 per arsip |
+| Kemasan ZIP otomatis | Lebih dari 30 file hasil |
+| Ukuran satu paket ZIP hasil | 1.900.000.000 byte |
 | Pekerjaan bersamaan | 1, tanpa antrean |
 | Waktu ekstraksi | Maksimal 1 jam |
 | Waktu tunggu password | 10 menit setiap permintaan |
-| Cadangan disk saat menulis hasil/bagian | 10.000.000.000 byte |
+| Cadangan disk saat menulis hasil, paket, atau bagian | 10.000.000.000 byte |
 | Ukuran bagian file besar | 1.900.000.000 byte |
 | Pembersihan cache dokumen tertinggal | Saat idle, umur lebih dari 4 jam |
 
@@ -92,8 +96,8 @@ docker build -t ekstrak-pribadi:local .
 docker run --rm --network none ekstrak-pribadi:local python -m unittest discover -s tests -v
 ```
 
-**Pemeriksaan terakhir: 57 tes lulus.** Cakupan meliputi ekstraksi ZIP/TAR.GZ/7z,
-penolakan traversal/link, batas byte aktual, pemecahan file, akses pemilik,
+**Pemeriksaan terakhir: 62 tes lulus.** Cakupan meliputi ekstraksi ZIP/TAR.GZ/7z,
+penolakan traversal/link, batas byte aktual, pemecahan file, pengemasan ZIP, akses pemilik,
 pembatalan, pembersihan, dialog password, dekripsi nyata, pemilihan media/fallback,
 HTTP simulasi, dan wizard. Lihat bukti serta batas
 verifikasi di [docs/verification.md](docs/verification.md).
@@ -219,9 +223,17 @@ Password hanya dipakai sementara di memori, tidak disimpan ke `.env`, log, atau
 berkas state pekerjaan. Pesan password dan
 caption tetap berada dalam riwayat chat Telegram dan tidak dihapus otomatis.
 
-Jalur folder dicantumkan pada caption; Telegram tidak membangun kembali struktur
-folder secara otomatis. Folder kosong tidak dikirim. Arsip di dalam arsip dikirim
-sebagai file tanpa ekstraksi rekursif.
+### ZIP hasil otomatis
+
+Jika ekstraksi menghasilkan lebih dari 30 file, bot mengirim `hasil-001.zip`,
+`hasil-002.zip`, dan seterusnya sesuai ukuran hasil. Buka setiap ZIP secara terpisah
+dan ekstrak ke folder tujuan yang sama untuk menyatukan hasil. Bot membuat dan
+menghapus setiap paket secara bergiliran. ZIP menyimpan isi file tanpa kompresi ulang.
+File yang terlalu besar untuk masuk paket dikirim terpisah. Jika ukurannya melebihi
+2.000 MB, bot membaginya menjadi potongan biner.
+
+Untuk kiriman satu per satu, jalur folder dicantumkan pada caption. Folder kosong
+tidak dikirim. Arsip di dalam arsip tidak diekstrak secara rekursif.
 
 ### Menggabungkan file besar
 

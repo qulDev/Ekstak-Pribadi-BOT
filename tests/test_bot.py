@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import unquote, urlparse
+from urllib.request import url2pathname
 from unittest.mock import patch
 
 from bot import APIError, Bot, Job, TelegramAPI, allowed_cache_file
@@ -106,6 +107,32 @@ class BotTests(unittest.TestCase):
         self.assertFalse(self.source.exists())
         self.assertFalse(list((self.bot.workdir / 'jobs').iterdir()))
         self.assertIsNone(self.bot.job)
+
+    def test_large_archive_uses_one_upload_and_returns_a_zip(self):
+        expected = {f'folder-{i}/file.txt': f'isi {i}'.encode() for i in range(301)}
+        with zipfile.ZipFile(self.source, 'w') as archive:
+            for i in range(3001):
+                archive.writestr(f'folder-{i}/', b'')
+            for name, data in expected.items():
+                archive.writestr(name, data)
+
+        calls = self.api.call
+        packages = []
+
+        def capture(method, **params):
+            if method == 'sendDocument':
+                path = Path(url2pathname(urlparse(params['document']).path))
+                with zipfile.ZipFile(path) as package:
+                    packages.append({name: package.read(name) for name in package.namelist()})
+            return calls(method, **params)
+
+        self.bot.job = Job('large.zip')
+        with patch.object(self.api, 'call', side_effect=capture), patch('bot.MIN_FREE', 0):
+            self.bot.work(self.bot.job, self.msg())
+        self.assertEqual(packages, [expected])
+        self.assertEqual(sum(method == 'getFile' for method, _ in self.api.calls), 1)
+        self.assertFalse(self.source.exists())
+        self.assertFalse(list(self.bot.jobsdir.iterdir()))
 
     def test_failed_progress_messages_do_not_abort_file_delivery(self):
         original_call = self.api.call

@@ -12,19 +12,23 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from extractor import ArchiveRejected, iter_send_files
+from extractor import ArchiveRejected, iter_send_files, iter_zip_packages
 
 MAX_INPUT = 2_000_000_000
 MAX_PHOTO = 10_000_000
 MIN_FREE = 10_000_000_000
 EXTRACT_TIMEOUT = 3600
 PASSWORD_TIMEOUT = 600
+INDIVIDUAL_FILE_LIMIT = 30
 HELP = ('Kirim ZIP, 7z, RAR, TAR atau arsip terkompresi (maks. 2.000 MB).\n'
         'Foto dan video yang didukung dikirim sebagai media dengan preview.\n'
-        'Batas hasil: 20 GB dan 300 file. Arsip di dalam arsip tidak diekstrak ulang.\n'
+        f'Lebih dari {INDIVIDUAL_FILE_LIMIT} file hasil dikemas otomatis menjadi ZIP.\n'
+        'Batas hasil: 20 GB, 10.000 file, dan 30.000 entri termasuk folder.\n'
+        'Arsip di dalam arsip tidak diekstrak ulang.\n'
         'Jika arsip terkunci, bot meminta password di chat. Salah? Coba lagi atau /cancel.\n'
         'Caption password: KATA_SANDI tetap bisa digunakan. Enkripsi RAR tertentu belum didukung.\n'
         '/status — lihat proses\n/cancel — hentikan proses\n'
@@ -310,18 +314,36 @@ class Bot:
             files = sorted(p for p in output.rglob('*') if p.is_file())
             if not files:
                 raise APIError('Arsip tidak berisi file biasa yang dapat dikirim.')
-            job.phase = f'Mengirim {len(files)} file'
-            self.notify(f'Ekstraksi selesai. Mengirim {len(files)} file.\n'
-                        'File di atas 2.000 MB akan dikirim sebagai beberapa bagian.')
-            for index, path in enumerate(files, 1):
-                for send_path, suffix in iter_send_files(path, parts, min_free=MIN_FREE):
-                    if job.cancel.is_set() or self.stopping.is_set():
+            def cancelled():
+                return job.cancel.is_set() or self.stopping.is_set()
+
+            bulk = len(files) > INDIVIDUAL_FILE_LIMIT
+            if bulk:
+                job.phase = 'Menyiapkan paket ZIP hasil'
+                self.notify(f'Ekstraksi selesai. Menyiapkan paket ZIP untuk {len(files)} file.')
+                outgoing = iter_zip_packages(files, output, parts, min_free=MIN_FREE, cancelled=cancelled)
+            else:
+                job.phase = f'Mengirim {len(files)} file'
+                self.notify(f'Ekstraksi selesai. Mengirim {len(files)} file.\n'
+                            'File di atas 2.000 MB akan dikirim sebagai beberapa bagian.')
+                outgoing = ((path, path.relative_to(output).as_posix()) for path in files)
+            with closing(outgoing):
+                for index, (path, caption) in enumerate(outgoing, 1):
+                    if cancelled():
                         raise APIError('Proses dibatalkan.')
-                    job.phase = f'Mengirim file {index}/{len(files)}{suffix}'
-                    self.send_file(send_path, (path.relative_to(output).as_posix() + suffix)[:900])
-                    sent += 1
-                    job.cancel.wait(1)
-            self.notify(f'Selesai. {sent} file terkirim. File sementara dibersihkan.')
+                    with closing(iter_send_files(path, parts, min_free=MIN_FREE)) as transfers:
+                        for send_path, suffix in transfers:
+                            if cancelled():
+                                raise APIError('Proses dibatalkan.')
+                            label = caption if bulk else f'file {index}/{len(files)}'
+                            job.phase = f'Mengirim {label}{suffix}'
+                            self.send_file(send_path, (caption + suffix)[:900])
+                            sent += 1
+                            job.cancel.wait(1)
+                    if bulk:
+                        job.phase = 'Menyiapkan hasil berikutnya'
+            summary = f'{sent} kiriman untuk {len(files)} file' if bulk else f'{sent} file terkirim'
+            self.notify(f'Selesai. {summary}. File sementara dibersihkan.')
         except (APIError, ArchiveRejected) as exc:
             self.notify(f'{exc}\nSudah terkirim: {sent} file. Anda dapat mengirim ulang arsip.')
         except Exception:
