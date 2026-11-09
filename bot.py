@@ -247,13 +247,17 @@ class Bot:
 
     def extract_once(self, job, source, output, directory, password):
         env = {'PATH': os.environ.get('PATH', ''), 'PYTHONUNBUFFERED': '1', 'PYTHONDONTWRITEBYTECODE': '1'}
-        with (directory / 'error.txt').open('wb') as error_log:
+        report = directory / 'extract-report.json'
+        with report.open('wb') as report_file:
             child = subprocess.Popen([sys.executable, str(Path(__file__).with_name('extractor.py')),
                                       str(source), str(output)], stdin=subprocess.PIPE,
-                                     stdout=subprocess.DEVNULL, stderr=error_log, env=env)
+                                      stdout=report_file, stderr=subprocess.DEVNULL, env=env)
             try:
-                child.stdin.write(json.dumps({'password': password, 'min_free': MIN_FREE}).encode() + b'\n')
-                child.stdin.close()
+                try:
+                    with child.stdin as config:
+                        config.write(json.dumps({'password': password, 'min_free': MIN_FREE}).encode() + b'\n')
+                except BrokenPipeError:
+                    pass  # An early exit can still have a useful exit status.
                 deadline = time.monotonic() + EXTRACT_TIMEOUT
                 while child.poll() is None:
                     if job.cancel.is_set() or self.stopping.is_set() or time.monotonic() > deadline:
@@ -263,10 +267,22 @@ class Bot:
                 if child.poll() is None:
                     child.kill()
                     child.wait()
-        detail = (directory / 'error.txt').read_text(errors='replace').strip()
-        if 'Traceback' in detail or len(detail) > 350:
-            detail = 'Arsip rusak atau format/enkripsinya belum didukung.'
-        return child.returncode, detail
+        status = child.returncode
+        if status == 0:
+            return 0, ''
+        try:
+            with report.open('rb') as report_file:
+                detail = json.loads(report_file.read(4096))
+        except ValueError:
+            detail = None
+        if status in (1, 2) and isinstance(detail, str) and 0 < len(detail) <= 350:
+            return status, detail
+        if status == 3 and isinstance(detail, str) and re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]{0,63}', detail):
+            code = detail
+        else:
+            code = f'SINYAL-{-status}' if status < 0 else f'EXIT-{status}'
+        print(f'Proses ekstraksi gagal ({code}).', flush=True)
+        return 1, f'Proses ekstraksi gagal. Kode diagnosis {code}.'
 
     def extract_with_password(self, job, source, output, directory, password):
         retry = password is not None

@@ -1,5 +1,6 @@
 """Stream archive contents; never ask the archive library to create filesystem objects."""
 import argparse
+import errno
 import json
 import os
 import re
@@ -304,12 +305,24 @@ def main():
         extract_archive(args.source, args.output, password=password,
                         limits=Limits(min_free=int(payload.get('min_free', Limits().min_free))))
     except PasswordNeeded as exc:
-        print(str(exc), file=sys.stderr)
+        print(json.dumps(str(exc)))
         return 2
-    except (ArchiveRejected, OSError, ValueError) as exc:
-        message = str(exc) if isinstance(exc, ArchiveRejected) else 'Gagal menulis hasil ekstraksi.'
-        print(message, file=sys.stderr)
+    except ArchiveRejected as exc:
+        print(json.dumps(str(exc)))
         return 1
+    except MemoryError:
+        print(json.dumps('Ekstraksi mencapai batas memori proses.'))
+        return 1
+    except OSError as exc:
+        detail = ('Ruang penyimpanan untuk ekstraksi tidak mencukupi.'
+                  if exc.errno in (errno.ENOSPC, errno.EDQUOT)
+                  else 'Gagal membaca arsip atau menulis hasil ekstraksi.')
+        print(json.dumps(detail))
+        return 1
+    except Exception as exc:
+        # Report the type only. Exception text and tracebacks may contain secrets.
+        print(json.dumps(type(exc).__name__))
+        return 3
     return 0
 
 

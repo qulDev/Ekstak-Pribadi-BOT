@@ -167,6 +167,33 @@ class BotTests(unittest.TestCase):
         self.assertFalse(self.source.exists())
         self.assertFalse((self.bot.workdir / 'escape.txt').exists())
 
+    def test_extractor_failure_reports_are_not_mixed_with_stderr(self):
+        worker = self.root / 'extractor.py'
+        cases = [
+            ('worker.ArchiveRejected("Batas entri terlampaui.")', 'Batas entri terlampaui.'),
+            ('MemoryError("private error")', 'Ekstraksi mencapai batas memori'),
+            ('RuntimeError("private error")', 'Kode diagnosis RuntimeError'),
+        ]
+        for error, expected in cases:
+            with self.subTest(error=error):
+                worker.write_text(
+                    'import sys\n'
+                    f'sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})\n'
+                    'import extractor as worker\n'
+                    'def fail(*args, **kwargs):\n'
+                    '    print("private warning " * 100, file=sys.stderr)\n'
+                    f'    raise {error}\n'
+                    'worker.extract_archive = fail\n'
+                    'raise SystemExit(worker.main())\n',
+                    encoding='utf-8',
+                )
+                with patch('bot.__file__', str(self.root / 'bot.py')):
+                    status, detail = self.bot.extract_once(
+                        Job('input.zip'), self.source, self.root / 'out', self.root, None)
+                self.assertEqual(status, 1)
+                self.assertIn(expected, detail)
+                self.assertNotIn('private', detail)
+
     def test_upload_uri_preserves_spaces_percent_hash_and_unicode(self):
         name = 'folder/a %# ü.txt'
         with zipfile.ZipFile(self.source, 'w') as z:
