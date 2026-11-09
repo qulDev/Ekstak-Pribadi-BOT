@@ -1,6 +1,7 @@
 """Private long-polling archive bot. Secrets never appear in log messages."""
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -59,13 +60,21 @@ class TelegramAPI:
                 raise APIError('Koneksi Telegram terputus atau respons tidak valid.') from None
             if result.get('ok'):
                 return result.get('result')
+            code = result.get('error_code', 0)
+            description = str(result.get('description', 'Permintaan Telegram ditolak.'))
             retry = int(result.get('parameters', {}).get('retry_after', 0))
-            if result.get('error_code') == 429 and 0 < retry <= 60 and attempt < 3:
+            if code in (400, 429):
+                # Local Bot API can return a flood limit as Bad Request without parameters.
+                flood = re.fullmatch(r'(?:Bad Request: )?Too Many Requests: retry after ([0-9]{1,10})',
+                                     description, re.IGNORECASE)
+                if flood:
+                    code = 429
+                    retry = retry or int(flood[1])
+            if code == 429 and 0 < retry <= 60 and attempt < 3:
                 time.sleep(retry)
                 continue
-            description = str(result.get('description', 'Permintaan Telegram ditolak.'))
             description = description.replace(self.token, '[token]')[:300]
-            raise APIError(description, result.get('error_code', 0), retry)
+            raise APIError(description, code, retry)
 
 
 def allowed_cache_file(path: Path, cache: Path, bot_key) -> bool:
@@ -263,7 +272,7 @@ class Bot:
             if output.exists():
                 shutil.rmtree(output)
             job.phase = 'Mengekstrak'
-            self.say('Mengekstrak arsip…')
+            self.notify('Mengekstrak arsip…')
             result, detail = self.extract_once(job, source, output, directory, password)
             password = None
             if result == 0:
@@ -284,7 +293,7 @@ class Bot:
             directory.mkdir()
             if shutil.disk_usage(self.workdir).free < MIN_FREE + MAX_INPUT:
                 raise APIError('Ruang penyimpanan bebas perlu minimal 12 GB untuk mulai.')
-            self.say(f'Mengunduh {job.name}…')
+            self.notify(f'Mengunduh {job.name}…')
             info = self.api.call('getFile', file_id=message['document']['file_id'], request_timeout=1800)
             candidate = Path(info.get('file_path', ''))
             if not allowed_cache_file(candidate, self.cache, self.bot_key):
@@ -302,8 +311,8 @@ class Bot:
             if not files:
                 raise APIError('Arsip tidak berisi file biasa yang dapat dikirim.')
             job.phase = f'Mengirim {len(files)} file'
-            self.say(f'Ekstraksi selesai. Mengirim {len(files)} file.\n'
-                     'File di atas 2.000 MB akan dikirim sebagai beberapa bagian.')
+            self.notify(f'Ekstraksi selesai. Mengirim {len(files)} file.\n'
+                        'File di atas 2.000 MB akan dikirim sebagai beberapa bagian.')
             for index, path in enumerate(files, 1):
                 for send_path, suffix in iter_send_files(path, parts, min_free=MIN_FREE):
                     if job.cancel.is_set() or self.stopping.is_set():

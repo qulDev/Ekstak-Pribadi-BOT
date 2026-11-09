@@ -54,7 +54,8 @@ def extract_archive(source: Path, output: Path, password=None, limits=Limits()) 
         with libarchive.file_reader(str(source), passphrase=password) as archive:
             for count, entry in enumerate(archive, 1):
                 if count > limits.max_entries:
-                    raise ArchiveRejected('Terlalu banyak entri dalam arsip.')
+                    raise ArchiveRejected(f'Arsip melebihi {limits.max_entries} entri (file dan folder). '
+                                          'Bagi isinya menjadi beberapa arsip terpisah.')
                 if entry.issym or entry.islnk or not (entry.isdir or entry.isreg):
                     raise ArchiveRejected('Link dan file khusus tidak diperbolehkan.')
                 path = safe_path(output, entry.pathname)
@@ -168,7 +169,8 @@ def extract_encrypted_7z(source, output, password, limits):
         with py7zr.SevenZipFile(source, password=password, max_extract_size=limits.max_total) as archive:
             entries = archive.list()
             if len(entries) > limits.max_entries:
-                raise ArchiveRejected('Terlalu banyak entri dalam arsip.')
+                raise ArchiveRejected(f'Arsip melebihi {limits.max_entries} entri (file dan folder). '
+                                      'Bagi isinya menjadi beberapa arsip terpisah.')
             files, seen, declared = [], set(), 0
             for entry in entries:
                 if entry.is_symlink or not (entry.is_directory or entry.is_file):
